@@ -50,14 +50,14 @@ def extract_policy_obs(obs_dict) -> torch.Tensor:
     obs_parts = [
         policy_obs["joint_pos"],             # [N, 7]
         policy_obs["joint_vel"],             # [N, 7]
-        policy_obs["cube_pos"],              # [N, 3]
+        policy_obs["cube1_pos"],             # [N, 3]
     ]
     return torch.cat(obs_parts, dim=-1)  # [N, 17]
 
 
 def set_cube_y(base_env, cube_y: float, device: str) -> None:
-    """모든 환경의 cube를 지정한 local Y 위치로 재배치."""
-    cube = base_env.scene["cube"]
+    """모든 환경의 cube1(파지 타겟)을 지정한 local Y 위치로 재배치."""
+    cube = base_env.scene["cube1"]
     origins = base_env.scene.env_origins  # [num_envs, 3]
     num_envs = origins.shape[0]
 

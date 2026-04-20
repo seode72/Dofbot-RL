@@ -15,12 +15,16 @@ import isaaclab.envs.mdp as mdp
 from mdp.observation import (
     left_contact_binary,
     right_contact_binary,
-    cube_pos_local_obs,
+    cube1_pos_local_obs,
+    cube2_pos_local_obs,
+    cube1_to_cube2_vec_obs,
+    cube_stack_contact_binary,
     left_finger_pos_obs,
     right_finger_pos_obs,
-    finger_center_to_cube_vec_obs,
+    finger_center_to_cube1_vec_obs,
 )
-from mdp.termination import terminate_on_excessive_joint_velocity
+from mdp.termination import terminate_on_excessive_joint_velocity, terminate_on_cube_dropped
+from mdp.actions import MimicGripperActionCfg
 from mdp.reward import (
     reward_reach_cube_exp,
     reward_per_finger_distance,
@@ -34,7 +38,8 @@ from cfg.dofbof_cfg import DOFBOT_CFG
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TARGET_PLANE_USD = os.path.join(BASE_DIR, "..", "usd", "target_plane.usd")
-CUBE_USD = os.path.join(BASE_DIR, "..", "usd", "cube.usd")
+CUBE_USD1 = os.path.join(BASE_DIR, "..", "usd", "cube1.usd")
+CUBE_USD2 = os.path.join(BASE_DIR, "..", "usd", "cube2.usd")
 
 
 
@@ -55,19 +60,35 @@ class DofBotSceneCfg(InteractiveSceneCfg):
 
     robot = DOFBOT_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
-    cube: RigidObjectCfg = RigidObjectCfg(
-        prim_path="{ENV_REGEX_NS}/Cube",
+    cube1: RigidObjectCfg = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/Cube1",
         spawn=sim_utils.UsdFileCfg(
-            usd_path=CUBE_USD,
+            usd_path=CUBE_USD1,
             activate_contact_sensors=True,
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 disable_gravity=False,
-                max_depenetration_velocity=0.5, # 5.0 -> (튕김 줄이기)
+                max_depenetration_velocity=0.5,
             ),
-            mass_props=sim_utils.MassPropertiesCfg(mass=0.03)   # 0.005
+            mass_props=sim_utils.MassPropertiesCfg(mass=0.03),
         ),
         init_state=RigidObjectCfg.InitialStateCfg(
-            pos=(0.0, 0.20, 0.03)  # 0.20 -> 0.10: Reverse Curriculum Generation 시작점
+            pos=(0.0, 0.20, 0.03)
+        ),
+    )
+
+    cube2: RigidObjectCfg = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/Cube2",
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=CUBE_USD2,
+            activate_contact_sensors=True,
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                disable_gravity=False,
+                max_depenetration_velocity=0.5,
+            ),
+            mass_props=sim_utils.MassPropertiesCfg(mass=0.03),
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(
+            pos=(0.20, 0.20, 0.03)
         ),
     )
 
@@ -87,8 +108,8 @@ class DofBotSceneCfg(InteractiveSceneCfg):
         history_length=6,
         debug_vis=False,
         track_air_time=True,
-        filter_prim_paths_expr=["{ENV_REGEX_NS}/Cube/Cube"],
-        )
+        filter_prim_paths_expr=["{ENV_REGEX_NS}/Cube1/Cube"],
+    )
 
     contact_sensor_right_finger = ContactSensorCfg(
         prim_path="{ENV_REGEX_NS}/Robot/link5/Finger_Right_03/Finger_Right_03",
@@ -96,7 +117,7 @@ class DofBotSceneCfg(InteractiveSceneCfg):
         history_length=6,
         debug_vis=False,
         track_air_time=True,
-        filter_prim_paths_expr=["{ENV_REGEX_NS}/Cube/Cube"],
+        filter_prim_paths_expr=["{ENV_REGEX_NS}/Cube1/Cube"],
     )
 
     contact_sensor_left_ground = ContactSensorCfg(
@@ -116,25 +137,25 @@ class DofBotSceneCfg(InteractiveSceneCfg):
         track_air_time=True,
         filter_prim_paths_expr=["/World/defaultGroundPlane"],
     )
+
+    contact_sensor_cube1 = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Cube1/Cube",
+        update_period=0.0,
+        history_length=6,
+        debug_vis=False,
+        filter_prim_paths_expr=["{ENV_REGEX_NS}/Cube2/Cube"],
+    )
+
+    contact_sensor_cube2 = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Cube2/Cube",
+        update_period=0.0,
+        history_length=6,
+        debug_vis=False,
+        filter_prim_paths_expr=["{ENV_REGEX_NS}/Cube1/Cube"],
+    )
         
 
-    # target_plane: RigidObjectCfg = RigidObjectCfg(
-    #     prim_path="{ENV_REGEX_NS}/Target",
-    #     spawn=sim_utils.UsdFileCfg(
-    #         usd_path=TARGET_PLANE_USD,
-    #         activate_contact_sensors=True,
-    #         rigid_props=sim_utils.RigidBodyPropertiesCfg(
-    #             disable_gravity=False,
-    #             max_depenetration_velocity=5.0,
-    #         ),
-    #     ),
-    #     init_state=RigidObjectCfg.InitialStateCfg(
-    #         pos=(0.1, 0.2, 0.0)
-    #     ),
-    # )
-
-    # # link5와 큐브가 접촉했는지 여부 확인
-    
+   
 
 
 @configclass
@@ -146,64 +167,33 @@ class CommandsCfg:
 @configclass
 class ActionsCfg:
 
-    ### Joint 1~4, Wrist는 Position 제어, Finger는 Velocity 제어 ### -> 이 아이디어가 맞을까? (버그 가능성)
 
-    # joint_effort = mdp.JointEffortActionCfg(
-    # asset_name="robot",
-    # joint_names=[
-    #     "joint1",
-    #     "joint2",
-    #     "joint3",
-    #     "joint4",
-    #     "Wrist_Twist_RevoluteJoint",
-    #     "Finger_Left_01_RevoluteJoint",
-    #     "Finger_Right_01_RevoluteJoint",
-    # ],
-    # preserve_order=True,
-    # )
 
     arm_pos = mdp.JointPositionActionCfg(
     asset_name="robot",
     joint_names=["joint1", "joint2", "joint3", "joint4"],
-    scale=0.7,  # 0.15 -> 0.3: 0.5는 joint 폭발, 중간값으로 조정
+    scale=0.25,  # 0.15 -> 0.3: 0.5는 joint 폭발, 중간값으로 조정
     use_default_offset=True,
     )
 
     wrist_pos = mdp.JointPositionActionCfg(
         asset_name="robot",
         joint_names=["Wrist_Twist_RevoluteJoint"],
-        scale=0.2,  # 0.05 -> 0.2: ±2.9° 너무 제한적
+        scale=0.25,  # 0.05 -> 0.2: ±2.9° 너무 제한적
         use_default_offset=True,
     )
 
-    finger_pos = mdp.JointPositionActionCfg(
+    # 1-DOF gripper action: 단일 명령을 두 손가락에 부호 반전해서 보냄 (실 하드웨어 single-motor 모사)
+    # Left 는 양의 방향, Right 는 음의 방향으로 동일 크기만큼 회전 → 양 손가락이 함께 열고 닫힘
+    finger_pos = MimicGripperActionCfg(
         asset_name="robot",
         joint_names=["Finger_Left_01_RevoluteJoint", "Finger_Right_01_RevoluteJoint"],
-        scale=0.15,  # 0.05
+        signs=(1.0, -1.0),
+        scale=0.3,
         use_default_offset=True,
     )
 
-    # arm_vel = mdp.JointVelocityActionCfg(
-    #     asset_name="robot",
-    #     joint_names=["joint1", "joint2", "joint3", "joint4"],
-    #     scale=0.1,
-    #     use_default_offset=True,
 
-    # )
-
-    # wrist_vel = mdp.JointVelocityActionCfg(
-    #     asset_name="robot",
-    #     joint_names=["Wrist_Twist_RevoluteJoint"],
-    #     scale=0.1,
-    #     use_default_offset=True,
-    # )
-
-    # finger_vel = mdp.JointVelocityActionCfg(
-    #     asset_name="robot",
-    #     joint_names=["Finger_Left_01_RevoluteJoint", "Finger_Right_01_RevoluteJoint"],
-    #     scale=0.2,  # 0.3 → 0.2: contact 시 충격 완화
-    #     use_default_offset=False,
-    # )
 
 
 @configclass
@@ -280,8 +270,16 @@ class ObservationsCfg:
             }
             
         )
-        cube_pos = ObsTerm(
-            func=cube_pos_local_obs,
+        cube1_pos = ObsTerm(
+            func=cube1_pos_local_obs,
+        )
+
+        cube2_pos = ObsTerm(
+            func=cube2_pos_local_obs,
+        )
+
+        cube1_to_cube2 = ObsTerm(
+            func=cube1_to_cube2_vec_obs,
         )
 
         left_finger_pos = ObsTerm(
@@ -296,13 +294,17 @@ class ObservationsCfg:
         left_finger_contact = ObsTerm(
             func = left_contact_binary
         )
-        
+
         right_finger_contact = ObsTerm(
             func = right_contact_binary
         )
 
-        cube_to_finger_vec = ObsTerm(
-            func=finger_center_to_cube_vec_obs
+        cube1_to_finger_vec = ObsTerm(
+            func=finger_center_to_cube1_vec_obs
+        )
+
+        cube_stack_contact = ObsTerm(
+            func=cube_stack_contact_binary
         )
 
 
@@ -332,11 +334,28 @@ class EventCfg:
     #     },
     # )
 
-    reset_cube = EventTermCfg(
+    reset_cube1 = EventTermCfg(
         func=mdp.reset_root_state_uniform,
         mode="reset",
         params={
-            "asset_cfg": SceneEntityCfg("cube"),
+            "asset_cfg": SceneEntityCfg("cube1"),
+            "pose_range": {
+                "x": (0.0, 0.0),
+                "y": (0.0, 0.0),
+                "z": (0.0, 0.0),
+                "roll": (0.0, 0.0),
+                "pitch": (0.0, 0.0),
+                "yaw": (0.0, 0.0),
+            },
+            "velocity_range": {},
+        },
+    )
+
+    reset_cube2 = EventTermCfg(
+        func=mdp.reset_root_state_uniform,
+        mode="reset",
+        params={
+            "asset_cfg": SceneEntityCfg("cube2"),
             "pose_range": {
                 "x": (0.0, 0.0),
                 "y": (0.0, 0.0),
@@ -374,23 +393,7 @@ class RewardsCfg:
 @configclass
 class TerminationsCfg:
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
-
-    # joint vel이 비정상적으로 커지면(orthogonal 에러 유발 전) episode 종료
-    # threshold=25 rad/s: velocity_limit(4.0)의 6배 — 정상범위 크게 벗어난 불안정 상태 조기 감지
-    # (이전 50.0은 너무 관대 - orthogonal 에러 도달 전에 못 잡음)
-    excessive_joint_vel = DoneTerm(
-        func=terminate_on_excessive_joint_velocity,
-        params={"max_joint_vel": 25.0},
-    )
-
-    # cube_out_of_bounds = DoneTerm(
-    #     func=terminate_on_cube_out_of_bounds,
-    #     params={
-    #         "max_dist_xy": 0.5, 
-    #         "min_z": -0.05,      
-    #         "max_z": 0.3,         
-    #     },
-    # )
+    excessive_joint_velocity = DoneTerm(func=terminate_on_excessive_joint_velocity, params={"max_joint_vel": 25.0})
 
 
 @configclass

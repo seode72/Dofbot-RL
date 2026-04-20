@@ -3,16 +3,16 @@ from isaaclab.managers import SceneEntityCfg
 
 
 def _get_finger_positions_and_cube(env):
-    """각 손가락 끝 + cube 위치 반환."""
+    """각 손가락 끝 + cube1(파지 타겟) 위치 반환."""
     robot = env.scene["robot"]
-    cube = env.scene["cube"]
+    cube1 = env.scene["cube1"]
 
     left_idx = robot.find_bodies("Finger_Left_03")[0][0]
     right_idx = robot.find_bodies("Finger_Right_03")[0][0]
 
     left_pos = robot.data.body_pos_w[:, left_idx, :3]
     right_pos = robot.data.body_pos_w[:, right_idx, :3]
-    cube_pos = cube.data.root_pos_w[:, :3]
+    cube_pos = cube1.data.root_pos_w[:, :3]
 
     return left_pos, right_pos, cube_pos
 

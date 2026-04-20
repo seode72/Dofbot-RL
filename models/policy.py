@@ -54,4 +54,4 @@ class PolicyModel(GaussianMixin, Model):
     def compute(self, inputs, role=""):
         states = inputs["states"]
         mean_actions = torch.tanh(self.net(states))
-        return mean_actions, {"log_std": self.log_std_parameter}
+        return mean_actions, self.log_std_parameter, {}

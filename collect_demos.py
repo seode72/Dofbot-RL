@@ -1,23 +1,15 @@
 """
-collect_demos.py
-================
-best_agent.pt로 성공(dual_finger_contact > 0) trajectory를 수집하고
-RFCL ReplayDataset 형식(h5 + json)과 states_dataset.pkl로 저장한다.
+Collect demonstration trajectories using a trained SAC policy.
+Saves to demos_1dof/ in the format expected by ReverseCurriculumLearner.
 
-성공 기준: reward_dual_finger_contact > 0 인 스텝이 하나라도 있으면 성공.
-
-저장:
-  demos/demos.h5   - traj_0, traj_1, ...  각각: obs[T+1,35], actions[T,7],
-                                                  success[T], rewards[T], states[T+1,27]
-  demos/demos.json - 에피소드 메타 (episode_id, success, reset_kwargs)
-  demos/states_dataset.pkl - {demo_id: {state, seed, reset_kwargs}} (InitialStateWrapper 형식)
-
-사용법:
-    ./isaaclab.sh -p scripts/dofbot_0331/collect_demos.py \\
-        --checkpoint logs/ppo_0331/checkpoints/best_agent.pt \\
-        --num_demos 20 --max_episodes 300
+env_states layout (39-dim):
+  [0:7]   joint_pos
+  [7:14]  joint_vel
+  [14:27] cube1 state (pos3 + quat4 + linvel3 + angvel3)
+  [27:30] left_contact_force  (net_forces_w current frame, 3-dim)
+  [30:33] right_contact_force (net_forces_w current frame, 3-dim)
+  [33:39] prev_action         (arm4 + wrist1 + gripper1 = 6-DOF)
 """
-
 from __future__ import annotations
 
 import argparse
@@ -27,15 +19,13 @@ from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--task",         type=str, default="Isaac-Dofbot-v0")
-parser.add_argument("--checkpoint",   type=str, required=True)
-parser.add_argument("--num_demos",    type=int, default=5,
-                    help="수집할 성공 데모 수")
-parser.add_argument("--max_episodes", type=int, default=500,
-                    help="최대 시도 에피소드 수")
-parser.add_argument("--out_dir",      type=str, default="demos")
+parser.add_argument("--checkpoint",   type=str, required=True,
+                    help="SAC checkpoint (best_agent.pt 등)")
+parser.add_argument("--num_demos",    type=int, default=10)
+parser.add_argument("--max_episodes", type=int, default=500)
+parser.add_argument("--out_dir",      type=str, default="demos_1dof")
 parser.add_argument("--seed",         type=int, default=42)
-parser.add_argument("--grace_steps",  type=int, default=15,
-                    help="성공 감지 후 몇 스텝 더 실행한 뒤 trajectory를 자를지")
+parser.add_argument("--grace_steps",  type=int, default=15)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 sys.argv = [sys.argv[0]] + hydra_args
@@ -43,11 +33,10 @@ sys.argv = [sys.argv[0]] + hydra_args
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
-# --- imports after launch ---
+# ── post-launch imports ────────────────────────────────────────────────────────
 import copy
 import json
 import os
-import pickle
 
 import h5py
 import numpy as np
@@ -55,13 +44,11 @@ import torch
 import gymnasium as gym
 
 import dofbot_task
-from dofbot_task.agent.ppo import PPO, PPO_DEFAULT_CONFIG
 from dofbot_task.dofbot_env_cfg import DofbotEnvCfg
-from skrl.memories.torch import Memory
-
+from dofbot_task.agent.sac import SAC, SAC_DEFAULT_CONFIG, RandomMemory
 from models.policy import PolicyModel
-from models.value import ValueModel
-from models.models_cfg import PolicyModelCfg, ValueModelCfg
+from models.critic import CriticModel
+from models.models_cfg import PolicyModelCfg, CriticModelCfg
 from mdp.reward import reward_dual_finger_contact
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -74,19 +61,22 @@ ARM_JOINT_NAMES = [
 ]
 
 
-def extract_policy_obs(obs_dict) -> torch.Tensor:
+# ── obs: dofbot_hong train.py와 동일한 10-dim ─────────────────────────────────
+def extract_obs(obs_dict) -> torch.Tensor:
     p = obs_dict["policy"]
+    finger_center = 0.5 * (p["left_finger_pos"] + p["right_finger_pos"])
+    finger_to_cube1 = p["cube1_pos"] - finger_center
     return torch.cat([
-        # p["joint_effort"],         # [N, 7]
         p["joint_pos"],            # [N, 7]
         p["joint_vel"],            # [N, 7]
-        p["cube_pos"],             # [N, 3]
-        # p["left_finger_pos"],      # [N, 3]
-        # p["right_finger_pos"],     # [N, 3]
-        # p["left_finger_contact"],  # [N, 1]
-        # p["right_finger_contact"], # [N, 1]
-        # p["cube_to_finger_vec"],   # [N, 3]
-    ], dim=-1)
+        p["cube1_pos"],            # [N, 3]
+        p["cube2_pos"],            # [N, 3]
+        p["left_finger_pos"],      # [N, 3]
+        p["right_finger_pos"],     # [N, 3]
+        p["left_finger_contact"],  # [N, 1]
+        p["right_finger_contact"], # [N, 1]
+        finger_to_cube1,           # [N, 3]
+    ], dim=-1)  # [N, 31]
 
 
 def get_joint_ids(base_env) -> list[int]:
@@ -101,60 +91,54 @@ def get_joint_ids(base_env) -> list[int]:
     return ids
 
 
+# ── env_states: 39-dim, ReverseCurriculumLearner 형식 ─────────────────────────
 def capture_state(base_env, joint_ids: list[int]) -> np.ndarray:
     """
-    현재 환경 상태를 70-dim float32 배열로 반환.
-
-    Layout:
-      [0:7]   joint_pos          - 로봇 관절 위치
-      [7:14]  joint_vel          - 로봇 관절 속도
-      [14:17] cube_local_pos     - cube 위치 (env_origin 기준)
-      [17:21] cube_quat          - cube 방향
-      [21:24] cube_lin_vel       - cube 선속도
-      [24:27] cube_ang_vel       - cube 각속도
-      [27:45] left_contact_hist  - 왼쪽 손가락 접촉력 history [6×3=18]
-      [45:63] right_contact_hist - 오른쪽 손가락 접촉력 history [6×3=18]
-      [63:70] prev_action        - 직전 action (action_rate_l2 복원용)
-
-    RFCL 역방향 커리큘럼에서 임의 t_i 지점 복원 시 contact history와
-    prev_action까지 재현하기 위해 저장한다.
+    Layout (39-dim):
+      [0:7]   joint_pos
+      [7:14]  joint_vel
+      [14:17] cube1_local_pos
+      [17:21] cube1_quat
+      [21:24] cube1_lin_vel
+      [24:27] cube1_ang_vel
+      [27:30] left_contact_force  (net_forces_w current frame, 3-dim)
+      [30:33] right_contact_force (net_forces_w current frame, 3-dim)
+      [33:39] prev_action         (6-DOF: arm4 + wrist1 + gripper1)
     """
     robot  = base_env.scene["robot"]
-    cube   = base_env.scene["cube"]
+    cube   = base_env.scene["cube1"]                          # dofbot_hong: cube1
     origin = base_env.scene.env_origins[0].cpu().numpy()
 
-    joint_pos  = robot.data.joint_pos[0, joint_ids].cpu().numpy()
-    joint_vel  = robot.data.joint_vel[0, joint_ids].cpu().numpy()
-    cube_pos_w = cube.data.root_pos_w[0].cpu().numpy()
-    cube_quat  = cube.data.root_quat_w[0].cpu().numpy()
-    cube_lv    = cube.data.root_lin_vel_w[0].cpu().numpy()
-    cube_av    = cube.data.root_ang_vel_w[0].cpu().numpy()
+    joint_pos  = robot.data.joint_pos[0, joint_ids].cpu().numpy()   # [7]
+    joint_vel  = robot.data.joint_vel[0, joint_ids].cpu().numpy()   # [7]
+    cube_pos_w = cube.data.root_pos_w[0].cpu().numpy()              # [3]
+    cube_quat  = cube.data.root_quat_w[0].cpu().numpy()             # [4]
+    cube_lv    = cube.data.root_lin_vel_w[0].cpu().numpy()          # [3]
+    cube_av    = cube.data.root_ang_vel_w[0].cpu().numpy()          # [3]
 
-    # contact sensor net force history: [history_length=6, 3] → flatten → [18]
-    left_sensor  = base_env.scene["contact_sensor_left_finger"]
-    right_sensor = base_env.scene["contact_sensor_right_finger"]
-    left_hist  = left_sensor.data.net_forces_w[0].cpu().numpy().flatten()   # [18]
-    right_hist = right_sensor.data.net_forces_w[0].cpu().numpy().flatten()  # [18]
+    # contact history: [history_length=6, 3] → flatten → [18]
+    left_hist  = base_env.scene["contact_sensor_left_finger"].data.net_forces_w[0].cpu().numpy().flatten()
+    right_hist = base_env.scene["contact_sensor_right_finger"].data.net_forces_w[0].cpu().numpy().flatten()
 
-    # prev_action: action_manager.action은 마지막으로 apply된 action
-    # 첫 스텝 이전에는 zeros (action_manager 초기화 상태)
+    # prev_action: 6-DOF (arm4 + wrist1 + gripper_1dof)
+    action_dim = base_env.action_manager.total_action_dim
     try:
-        prev_action = base_env.action_manager.action[0].cpu().numpy()  # [7]
+        prev_action = base_env.action_manager.action[0].cpu().numpy()  # [6]
     except Exception:
-        prev_action = np.zeros(7, dtype=np.float32)
+        prev_action = np.zeros(action_dim, dtype=np.float32)
 
     return np.concatenate([
         joint_pos, joint_vel,
-        cube_pos_w - origin, cube_quat,
-        cube_lv, cube_av,
+        cube_pos_w - origin, cube_quat, cube_lv, cube_av,
         left_hist, right_hist,
         prev_action,
-    ]).astype(np.float32)  # [70]
+    ]).astype(np.float32)  # [39]
 
 
 def main():
     device = args_cli.device
 
+    # ── 환경 ──────────────────────────────────────────────────────────────────
     env_cfg = DofbotEnvCfg()
     env_cfg.scene.num_envs = 1
     env_cfg.seed = args_cli.seed
@@ -162,55 +146,53 @@ def main():
 
     env      = gym.make(args_cli.task, cfg=env_cfg)
     base_env = env.unwrapped
-
     obs_dict, _ = env.reset()
-    obs = extract_policy_obs(obs_dict).to(device)
-    obs_dim    = obs.shape[-1]
-    action_dim = base_env.action_manager.total_action_dim
+    obs = extract_obs(obs_dict).to(device)
 
-    joint_ids = get_joint_ids(base_env)
+    obs_dim    = obs.shape[-1]     # 10
+    action_dim = base_env.action_manager.total_action_dim  # 6
+    joint_ids  = get_joint_ids(base_env)
 
-    # --- policy 로드 ---
-    policy_m = PolicyModel(obs_dim, action_dim, PolicyModelCfg(), device)
-    value_m  = ValueModel(obs_dim, 1,          ValueModelCfg(),  device)
-    memory   = Memory(1, 1, device)
-    ppo_cfg  = copy.deepcopy(PPO_DEFAULT_CONFIG)
-    agent = PPO(
-        models={"policy": policy_m, "value": value_m},
-        memory=memory,
-        observation_space=obs_dim,
-        action_space=action_dim,
-        device=device,
-        cfg=ppo_cfg,
-    )
+    # ── SAC policy 로드 ────────────────────────────────────────────────────────
+    NUM_QS = 10
+    policy = PolicyModel(obs_dim, action_dim, PolicyModelCfg(), device)
+    critics = [CriticModel(obs_dim, action_dim, CriticModelCfg(), device) for _ in range(NUM_QS)]
+    target_critics = [CriticModel(obs_dim, action_dim, CriticModelCfg(), device) for _ in range(NUM_QS)]
+    memory = RandomMemory(memory_size=1, num_envs=1, device=device)
+
+    models = {"policy": policy}
+    models.update({f"critic_{i+1}": c for i, c in enumerate(critics)})
+    models.update({f"target_critic_{i+1}": tc for i, tc in enumerate(target_critics)})
+
+    sac_cfg = copy.deepcopy(SAC_DEFAULT_CONFIG)
+    agent = SAC(models=models, memory=memory,
+                observation_space=obs_dim, action_space=action_dim,
+                device=device, cfg=sac_cfg)
     agent.init()
 
     ckpt = torch.load(args_cli.checkpoint, map_location=device)
-    policy_m.load_state_dict(ckpt["policy"])
-    if "value" in ckpt:
-        value_m.load_state_dict(ckpt["value"])
-    print(f"[INFO] Loaded: {args_cli.checkpoint}")
+    policy.load_state_dict(ckpt["policy"])
+    print(f"[INFO] SAC policy loaded: {args_cli.checkpoint}")
 
+    # ── 수집 ──────────────────────────────────────────────────────────────────
     out_dir = os.path.join(SCRIPT_DIR, args_cli.out_dir)
     os.makedirs(out_dir, exist_ok=True)
 
-    # --- 수집 ---
     collected: list[dict] = []
     ep_count = 0
+    grace_steps = args_cli.grace_steps
 
-    grace_steps   = args_cli.grace_steps  # 첫 성공 후 이 스텝만큼 더 실행 후 자름
-
-    def _reset_ep_buffers():
+    def _reset_ep():
         return (
-            [obs[0].cpu().numpy()],
-            [capture_state(base_env, joint_ids)],
-            [], [],
+            [obs[0].cpu().numpy()],       # ep_obs
+            [capture_state(base_env, joint_ids)],  # ep_states
+            [], [],                        # ep_actions, ep_success
         )
 
-    ep_obs, ep_states, ep_actions, ep_success = _reset_ep_buffers()
-    first_success_step: int | None = None  # 이번 ep에서 처음 성공한 스텝 index
+    ep_obs, ep_states, ep_actions, ep_success = _reset_ep()
+    first_success_step: int | None = None
 
-    print(f"[INFO] target={args_cli.num_demos} demos, max_ep={args_cli.max_episodes}, grace_steps={grace_steps}")
+    print(f"[INFO] Collecting {args_cli.num_demos} demos (max {args_cli.max_episodes} eps)")
 
     while (
         simulation_app.is_running()
@@ -221,7 +203,7 @@ def main():
             actions, _, _ = agent.act(states=obs, timestep=0, timesteps=0)
 
         next_obs_dict, _, terminated, truncated, _ = env.step(actions)
-        next_obs = extract_policy_obs(next_obs_dict).to(device)
+        next_obs = extract_obs(next_obs_dict).to(device)
 
         dual = reward_dual_finger_contact(base_env)[0].item()
         step_success = float(dual > 0.0)
@@ -231,13 +213,10 @@ def main():
         ep_states.append(capture_state(base_env, joint_ids))
         ep_obs.append(next_obs[0].cpu().numpy())
 
-        # 처음 성공한 스텝 기록
         if step_success > 0.5 and first_success_step is None:
-            first_success_step = len(ep_actions) - 1  # 0-indexed
+            first_success_step = len(ep_actions) - 1
 
-        env_done = (terminated | truncated)[0].item()
-
-        # 성공 후 grace_steps 만큼 지나면 강제 종료
+        env_done  = (terminated | truncated)[0].item()
         grace_done = (
             first_success_step is not None
             and (len(ep_actions) - 1 - first_success_step) >= grace_steps
@@ -246,53 +225,44 @@ def main():
         if env_done or grace_done:
             ep_count += 1
             succeeded = first_success_step is not None
-            n_success_steps = sum(1 for s in ep_success if s > 0.5)
 
             if succeeded:
                 collected.append({
-                    "obs":     np.array(ep_obs,     dtype=np.float32),  # [T+1, 35]
-                    "actions": np.array(ep_actions, dtype=np.float32),  # [T,   7]
-                    "success": np.array(ep_success, dtype=np.float32),  # [T]
-                    "rewards": np.array(ep_success, dtype=np.float32),  # [T]  sparse
-                    "states":  np.array(ep_states,  dtype=np.float32),  # [T+1, 27]
+                    "obs":     np.array(ep_obs,     dtype=np.float32),  # [T+1, 10]
+                    "actions": np.array(ep_actions, dtype=np.float32),  # [T,   6]
+                    "rewards": np.array(ep_success, dtype=np.float32),  # [T]   sparse
+                    "states":  np.array(ep_states,  dtype=np.float32),  # [T+1, 69]
                 })
-                cut_reason = "grace" if grace_done else "env_done"
-                print(
-                    f"[EP {ep_count:>4}] SUCCESS {len(collected):>3}/{args_cli.num_demos}"
-                    f"  len={len(ep_actions)}  success_steps={n_success_steps}"
-                    f"  cut={cut_reason}"
-                )
+                print(f"[EP {ep_count:>4}] SUCCESS {len(collected):>3}/{args_cli.num_demos}"
+                      f"  len={len(ep_actions)}")
             else:
-                print(f"[EP {ep_count:>4}] fail  len={len(ep_actions)}")
+                print(f"[EP {ep_count:>4}] fail   len={len(ep_actions)}")
 
             obs_dict, _ = env.reset()
-            obs = extract_policy_obs(obs_dict).to(device)
-            ep_obs, ep_states, ep_actions, ep_success = _reset_ep_buffers()
+            obs = extract_obs(obs_dict).to(device)
+            ep_obs, ep_states, ep_actions, ep_success = _reset_ep()
             first_success_step = None
         else:
             obs = next_obs
 
     n = len(collected)
-    print(f"\n[INFO] Collected {n}/{ep_count} episodes succeeded.")
-
+    print(f"\n[INFO] Collected {n}/{ep_count} succeeded.")
     if n == 0:
-        print("[WARN] No demos collected. Not saving.")
+        print("[WARN] No demos. Not saving.")
         env.close()
         return
 
-    # --- HDF5 + JSON (RFCL ReplayDataset 형식) ---
+    # ── 저장: ReplayDataset + ReverseCurriculumLearner 형식 ───────────────────
     h5_path   = os.path.join(out_dir, "demos.h5")
     json_path = os.path.join(out_dir, "demos.json")
-    pkl_path  = os.path.join(out_dir, "states_dataset.pkl")
 
     with h5py.File(h5_path, "w") as f:
         for i, demo in enumerate(collected):
             g = f.create_group(f"traj_{i}")
-            g.create_dataset("obs",     data=demo["obs"])
-            g.create_dataset("actions", data=demo["actions"])
-            g.create_dataset("success", data=demo["success"])
-            g.create_dataset("rewards", data=demo["rewards"])
-            g.create_dataset("env_states", data=demo["states"])
+            g.create_dataset("obs",        data=demo["obs"])      # [T+1, 10]
+            g.create_dataset("actions",    data=demo["actions"])  # [T,   6]
+            g.create_dataset("rewards",    data=demo["rewards"])  # [T]
+            g.create_dataset("env_states", data=demo["states"])   # [T+1, 69]
 
     meta = {"episodes": [
         {"episode_id": i, "success": True, "reset_kwargs": {}, "episode_seed": None}
@@ -301,18 +271,7 @@ def main():
     with open(json_path, "w") as f:
         json.dump(meta, f, indent=2)
 
-    # --- states_dataset.pkl (InitialStateWrapper 형식) ---
-    states_dataset = {
-        i: {"state": demo["states"], "seed": None, "reset_kwargs": {}}
-        for i, demo in enumerate(collected)
-    }
-    with open(pkl_path, "wb") as f:
-        pickle.dump(states_dataset, f)
-
-    print(f"[INFO] Saved → {h5_path}")
-    print(f"[INFO]         {json_path}")
-    print(f"[INFO]         {pkl_path}")
-
+    print(f"[INFO] Saved → {h5_path}  ({n} demos, env_states 39-dim)")
     env.close()
 
 

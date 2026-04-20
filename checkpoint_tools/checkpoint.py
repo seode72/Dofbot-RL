@@ -157,6 +157,7 @@ def save_checkpoint(agent, checkpoint_path: str, step: int, completed_eps: int =
 
     torch.save(payload, checkpoint_path)
     print(f"[INFO] SAC checkpoint saved: {checkpoint_path}")
+    
 # Agent의 Replay Memory 전체를 파일로 백업
 def save_memory(memory, memory_path: str) -> None:
     """Save skrl memory states to a file."""
